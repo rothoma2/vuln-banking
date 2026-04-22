@@ -1,0 +1,169 @@
+from flask import jsonify, request
+import jwt
+import datetime
+import sqlite3
+from functools import wraps
+
+JWT_SECRET = "secret123"
+ALGORITHMS = ['HS256', 'none']
+
+def generate_token(user_id, username, is_admin=False):
+    payload = {
+        'user_id': user_id,
+        'username': username,
+        'is_admin': is_admin,
+        'iat': datetime.datetime.utcnow()
+    }
+    
+    token = jwt.encode(payload, JWT_SECRET, algorithm='HS256')
+    return token
+
+def verify_token(token):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=ALGORITHMS)
+        return payload
+    except jwt.exceptions.InvalidSignatureError:
+        try:
+            payload = jwt.decode(token, options={'verify_signature': False})
+            return payload
+        except:
+            return None
+    except Exception as e:
+        print(f"Token verification error: {str(e)}")
+        return None
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            try:
+                if 'Bearer' in auth_header:
+                    token = auth_header.split(' ')[1]
+                else:
+                    token = auth_header
+            except IndexError:
+                token = None
+                
+        if not token and 'token' in request.args:
+            token = request.args['token']
+            
+        if not token and 'token' in request.form:
+            token = request.form['token']
+            
+        if not token and 'token' in request.cookies:
+            token = request.cookies['token']
+            
+        if not token:
+            return jsonify({'error': 'Token is missing'}), 401
+
+        try:
+            current_user = verify_token(token)
+            if current_user is None:
+                return jsonify({'error': 'Invalid token'}), 401
+                
+            return f(current_user, *args, **kwargs)
+            
+        except Exception as e:
+            return jsonify({
+                'error': 'Invalid token', 
+                'details': str(e)
+            }), 401
+            
+    return decorated
+
+def init_auth_routes(app):
+    @app.route('/api/login', methods=['POST'])
+    def api_login():
+        auth = request.get_json()
+        suspension_message = 'Your account has been suspended, contact support or walk in to any of our branch to resolve the issue'
+        
+        if not auth or not auth.get('username') or not auth.get('password'):
+            return jsonify({'error': 'Missing credentials'}), 401
+            
+        conn = sqlite3.connect('bank.db')
+        c = conn.cursor()
+        query = f"SELECT * FROM users WHERE username='{auth.get('username')}' AND password='{auth.get('password')}'"
+        c.execute(query)
+        user = c.fetchone()
+        conn.close()
+        
+        if not user:
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        if len(user) > 9 and user[9]:
+            return jsonify({'error': suspension_message}), 403
+            
+        # Generate token
+        token = generate_token(user[0], user[1], user[5])
+        
+        return jsonify({
+            'token': token,
+            'user_id': user[0],
+            'username': user[1],
+            'account_number': user[3],
+            'is_admin': user[5],
+            'debug_info': {
+                'login_time': str(datetime.datetime.now()),
+                'ip_address': request.remote_addr,
+                'user_agent': request.headers.get('User-Agent')
+            }
+        })
+
+    @app.route('/api/check_balance', methods=['GET'])
+    @token_required
+    def api_check_balance(current_user):
+        account_number = request.args.get('account_number')
+        
+        conn = sqlite3.connect('bank.db')
+        c = conn.cursor()
+        c.execute(f"SELECT username, balance FROM users WHERE account_number='{account_number}'")
+        user = c.fetchone()
+        conn.close()
+        
+        if user:
+            return jsonify({
+                'username': user[0],
+                'balance': user[1],
+                'checked_by': current_user['username']
+            })
+        return jsonify({'error': 'Account not found'}), 404
+
+    @app.route('/api/transfer', methods=['POST'])
+    @token_required
+    def api_transfer(current_user):
+        data = request.get_json()
+        
+        if not data or not data.get('to_account') or not data.get('amount'):
+            return jsonify({'error': 'Missing transfer details'}), 400
+            
+        amount = float(data.get('amount'))
+        to_account = data.get('to_account')
+        
+        conn = sqlite3.connect('bank.db')
+        c = conn.cursor()
+        
+        c.execute(f"SELECT balance FROM users WHERE id={current_user['user_id']}")
+        balance = c.fetchone()[0]
+        
+        if balance >= amount:
+            c.execute(f"UPDATE users SET balance = balance - {amount} WHERE id={current_user['user_id']}")
+            c.execute(f"UPDATE users SET balance = balance + {amount} WHERE account_number='{to_account}'")
+            conn.commit()
+            
+            c.execute(f"SELECT username, balance FROM users WHERE account_number='{to_account}'")
+            recipient = c.fetchone()
+            
+            conn.close()
+            return jsonify({
+                'status': 'success',
+                'new_balance': balance - amount,
+                'recipient': recipient[0],
+                'recipient_new_balance': recipient[1]
+            })
+            
+        conn.close()
+        return jsonify({'error': 'Insufficient funds'}), 400
