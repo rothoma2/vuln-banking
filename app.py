@@ -17,6 +17,8 @@ import time
 from functools import wraps
 from collections import defaultdict
 import requests
+import socket
+import ipaddress
 from urllib.parse import urlparse
 import platform
 
@@ -81,6 +83,24 @@ def cleanup_rate_limit_storage():
         ]
         if not rate_limit_storage[key]:
             del rate_limit_storage[key]
+
+def is_public_image_url(image_url):
+    parsed = urlparse(image_url)
+
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+        return False
+
+    try:
+        addrinfo = socket.getaddrinfo(parsed.hostname, parsed.port or None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False
+
+    for _, _, _, _, sockaddr in addrinfo:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if not ip.is_global:
+            return False
+
+    return True
 
 def get_client_ip():
     """Get client IP address, considering proxy headers"""
@@ -621,8 +641,11 @@ def upload_profile_picture_url(current_user):
         if not image_url:
             return jsonify({'status': 'error', 'message': 'image_url is required'}), 400
 
-        resp = requests.get(image_url, timeout=10, allow_redirects=True, verify=False)
-        if resp.status_code >= 400:
+        if not is_public_image_url(image_url):
+            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
+
+        resp = requests.get(image_url, timeout=10, allow_redirects=False)
+        if resp.status_code >= 300:
             return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {resp.status_code}'}), 400
 
         parsed = urlparse(image_url)
