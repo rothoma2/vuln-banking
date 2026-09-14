@@ -116,9 +116,10 @@ def resolve_public_ip(hostname, port):
 
     resolved_ips = []
     for _, _, _, _, sockaddr in addrinfo:
-        ip = ipaddress.ip_address(sockaddr[0])
+        ip_text = sockaddr[0].split('%', 1)[0]
+        ip = ipaddress.ip_address(ip_text)
         if ip.is_global:
-            resolved_ips.append(sockaddr[0])
+            resolved_ips.append(ip_text)
 
     return resolved_ips[0] if resolved_ips else None
 
@@ -151,7 +152,8 @@ def fetch_public_image(parsed, resolved_ip):
         path = f'{path}?{parsed.query}'
 
     is_default_port = (parsed.scheme == 'http' and port == 80) or (parsed.scheme == 'https' and port == 443)
-    host_header = parsed.hostname if is_default_port else f'{parsed.hostname}:{port}'
+    formatted_hostname = f'[{parsed.hostname}]' if ':' in parsed.hostname else parsed.hostname
+    host_header = formatted_hostname if is_default_port else f'{formatted_hostname}:{port}'
 
     if parsed.scheme == 'https':
         conn = ValidatedHTTPSConnection(resolved_ip, parsed.hostname, port, timeout=10)

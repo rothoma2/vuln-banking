@@ -92,6 +92,15 @@ class RemoteImageFetchTests(unittest.TestCase):
 
         self.assertEqual(resolved_ip, '93.184.216.34')
 
+    def test_resolve_public_ip_handles_scoped_ipv6_addresses(self):
+        with patch.object(REMOTE_FETCH['socket'], 'getaddrinfo', return_value=[
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('fe80::1%eth0', 443, 0, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:2800:220:1:248:1893:25c8:1946', 443, 0, 0)),
+        ]):
+            resolved_ip = REMOTE_FETCH['resolve_public_ip']('example.com', 443)
+
+        self.assertEqual(resolved_ip, '2606:2800:220:1:248:1893:25c8:1946')
+
     def test_fetch_public_image_rejects_large_content_length(self):
         class FakeResponse:
             status = 200
@@ -147,6 +156,35 @@ class RemoteImageFetchTests(unittest.TestCase):
         }):
             with self.assertRaisesRegex(REMOTE_FETCH['RemoteImageTooLargeError'], '8 bytes'):
                 REMOTE_FETCH['fetch_public_image'](parsed, '93.184.216.34')
+
+    def test_fetch_public_image_formats_ipv6_host_header(self):
+        class FakeResponse:
+            status = 200
+
+            def getheader(self, name):
+                return None
+
+            def read(self, size=-1):
+                return b''
+
+        class FakeConnection:
+            def request(self, method, path, headers):
+                self.request_args = (method, path, headers)
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        fake_connection = FakeConnection()
+        parsed = REMOTE_FETCH['parse_public_image_url']('http://[2001:4860:4860::8888]:8443/avatar.png')
+        with patch.dict(REMOTE_FETCH, {'ValidatedHTTPConnection': lambda *args, **kwargs: fake_connection}):
+            status_code, response_body = REMOTE_FETCH['fetch_public_image'](parsed, '2001:4860:4860::8888')
+
+        self.assertEqual(status_code, 200)
+        self.assertEqual(response_body, b'')
+        self.assertEqual(fake_connection.request_args[2]['Host'], '[2001:4860:4860::8888]:8443')
 
 
 if __name__ == '__main__':
