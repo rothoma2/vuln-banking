@@ -19,7 +19,8 @@ from collections import defaultdict
 import socket
 import ipaddress
 from urllib.parse import urlparse
-import urllib3
+import http.client
+import ssl
 import platform
 
 load_dotenv()
@@ -84,14 +85,13 @@ def cleanup_rate_limit_storage():
         if not rate_limit_storage[key]:
             del rate_limit_storage[key]
 
-def is_public_image_url(image_url):
+def parse_public_image_url(image_url):
     parsed = urlparse(image_url)
 
     if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
-        return False
+        return None
 
-    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    return resolve_public_ip(parsed.hostname, port) is not None
+    return parsed
 
 def resolve_public_ip(hostname, port):
     try:
@@ -108,14 +108,28 @@ def resolve_public_ip(hostname, port):
 
     return resolved_ips[0] if resolved_ips else None
 
-def fetch_public_image_url(image_url):
-    parsed = urlparse(image_url)
+class ValidatedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, resolved_ip, hostname, port, timeout=10):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self.resolved_ip = resolved_ip
+
+    def connect(self):
+        self.sock = self._create_connection((self.resolved_ip, self.port), self.timeout, self.source_address)
+
+class ValidatedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, resolved_ip, hostname, port, timeout=10):
+        super().__init__(hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self.resolved_ip = resolved_ip
+
+    def connect(self):
+        sock = self._create_connection((self.resolved_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+def fetch_public_image(parsed, resolved_ip):
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    resolved_ip = resolve_public_ip(parsed.hostname, port)
-
-    if not resolved_ip:
-        raise ValueError('Only public http(s) image URLs are allowed')
-
     path = parsed.path or '/'
     if parsed.params:
         path = f'{path};{parsed.params}'
@@ -124,20 +138,18 @@ def fetch_public_image_url(image_url):
 
     is_default_port = (parsed.scheme == 'http' and port == 80) or (parsed.scheme == 'https' and port == 443)
     host_header = parsed.hostname if is_default_port else f'{parsed.hostname}:{port}'
-    timeout = urllib3.Timeout(connect=10, read=10)
 
     if parsed.scheme == 'https':
-        pool = urllib3.HTTPSConnectionPool(
-            host=resolved_ip,
-            port=port,
-            cert_reqs='CERT_REQUIRED',
-            assert_hostname=parsed.hostname,
-            server_hostname=parsed.hostname
-        )
+        conn = ValidatedHTTPSConnection(resolved_ip, parsed.hostname, port, timeout=10)
     else:
-        pool = urllib3.HTTPConnectionPool(host=resolved_ip, port=port)
+        conn = ValidatedHTTPConnection(resolved_ip, parsed.hostname, port, timeout=10)
 
-    return pool.urlopen('GET', path, headers={'Host': host_header}, redirect=False, timeout=timeout, preload_content=True)
+    try:
+        conn.request('GET', path, headers={'Host': host_header})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
 
 def get_client_ip():
     """Get client IP address, considering proxy headers"""
@@ -678,21 +690,30 @@ def upload_profile_picture_url(current_user):
         if not image_url:
             return jsonify({'status': 'error', 'message': 'image_url is required'}), 400
 
-        if not is_public_image_url(image_url):
+        parsed = parse_public_image_url(image_url)
+        if not parsed:
             return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
 
-        resp = fetch_public_image_url(image_url)
-        if resp.status >= 300:
-            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {resp.status}'}), 400
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        resolved_ip = resolve_public_ip(parsed.hostname, port)
+        if not resolved_ip:
+            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
 
-        parsed = urlparse(image_url)
+        try:
+            status_code, response_body = fetch_public_image(parsed, resolved_ip)
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            return jsonify({'status': 'error', 'message': 'Failed to fetch URL'}), 400
+
+        if status_code >= 300:
+            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {status_code}'}), 400
+
         basename = os.path.basename(parsed.path) or 'downloaded'
         filename = secure_filename(basename)
         filename = f"{random.randint(1, 1000000)}_{filename}"
         file_path = os.path.join(UPLOAD_FOLDER, filename)
 
         with open(file_path, 'wb') as f:
-            f.write(resp.data)
+            f.write(response_body)
 
         execute_query(
             "UPDATE users SET profile_picture = %s WHERE id = %s",
