@@ -49,6 +49,7 @@ app.secret_key = "secret123"
 RATE_LIMIT_WINDOW = 3 * 60 * 60
 UNAUTHENTICATED_LIMIT = 5
 AUTHENTICATED_LIMIT = 10
+MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 
 rate_limit_storage = defaultdict(list)
 
@@ -102,9 +103,8 @@ def resolve_public_ip(hostname, port):
     resolved_ips = []
     for _, _, _, _, sockaddr in addrinfo:
         ip = ipaddress.ip_address(sockaddr[0])
-        if not ip.is_global:
-            return None
-        resolved_ips.append(sockaddr[0])
+        if ip.is_global:
+            resolved_ips.append(sockaddr[0])
 
     return resolved_ips[0] if resolved_ips else None
 
@@ -147,9 +147,41 @@ def fetch_public_image(parsed, resolved_ip):
     try:
         conn.request('GET', path, headers={'Host': host_header})
         response = conn.getresponse()
-        return response.status, response.read()
+        content_length = response.getheader('Content-Length')
+        if content_length is not None:
+            try:
+                content_length = int(content_length)
+            except (TypeError, ValueError):
+                content_length = None
+            if content_length is not None and content_length > MAX_REMOTE_IMAGE_BYTES:
+                raise ValueError('Remote image exceeds size limit')
+
+        response_body = bytearray()
+        while len(response_body) <= MAX_REMOTE_IMAGE_BYTES:
+            chunk = response.read(min(65536, MAX_REMOTE_IMAGE_BYTES - len(response_body) + 1))
+            if not chunk:
+                return response.status, bytes(response_body)
+            response_body.extend(chunk)
+
+        raise ValueError('Remote image exceeds size limit')
     finally:
         conn.close()
+
+def download_public_image(image_url):
+    parsed = parse_public_image_url(image_url)
+    if not parsed:
+        raise ValueError('Only public http(s) image URLs are allowed')
+
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    resolved_ip = resolve_public_ip(parsed.hostname, port)
+    if not resolved_ip:
+        raise ValueError('Only public http(s) image URLs are allowed')
+
+    status_code, response_body = fetch_public_image(parsed, resolved_ip)
+    if status_code >= 300:
+        raise ValueError(f'Failed to fetch URL: HTTP {status_code}')
+
+    return parsed, response_body
 
 def get_client_ip():
     """Get client IP address, considering proxy headers"""
@@ -690,22 +722,12 @@ def upload_profile_picture_url(current_user):
         if not image_url:
             return jsonify({'status': 'error', 'message': 'image_url is required'}), 400
 
-        parsed = parse_public_image_url(image_url)
-        if not parsed:
-            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
-
-        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-        resolved_ip = resolve_public_ip(parsed.hostname, port)
-        if not resolved_ip:
-            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
-
         try:
-            status_code, response_body = fetch_public_image(parsed, resolved_ip)
+            parsed, response_body = download_public_image(image_url)
+        except ValueError as exc:
+            return jsonify({'status': 'error', 'message': str(exc)}), 400
         except (OSError, ssl.SSLError, http.client.HTTPException):
             return jsonify({'status': 'error', 'message': 'Failed to fetch URL'}), 400
-
-        if status_code >= 300:
-            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {status_code}'}), 400
 
         basename = os.path.basename(parsed.path) or 'downloaded'
         filename = secure_filename(basename)
