@@ -12,6 +12,10 @@ from urllib.parse import urlparse
 APP_PATH = Path('/home/runner/work/vuln-banking/vuln-banking/app.py')
 TARGET_NAMES = {
     'MAX_REMOTE_IMAGE_BYTES',
+    'InvalidRemoteImageURLError',
+    'RemoteImageTooLargeError',
+    'RemoteImageHTTPStatusError',
+    'remote_image_size_limit_message',
     'parse_public_image_url',
     'resolve_public_ip',
     'ValidatedHTTPConnection',
@@ -62,7 +66,7 @@ class RemoteImageFetchTests(unittest.TestCase):
 
     def test_download_public_image_rejects_private_destination(self):
         with patch.dict(REMOTE_FETCH, {'resolve_public_ip': lambda hostname, port: None}):
-            with self.assertRaisesRegex(ValueError, 'Only public http\\(s\\) image URLs are allowed'):
+            with self.assertRaisesRegex(REMOTE_FETCH['InvalidRemoteImageURLError'], 'Only public http\\(s\\) image URLs are allowed'):
                 REMOTE_FETCH['download_public_image']('https://example.com/avatar.png')
 
     def test_download_public_image_rejects_redirects(self):
@@ -70,8 +74,14 @@ class RemoteImageFetchTests(unittest.TestCase):
             'resolve_public_ip': lambda hostname, port: '93.184.216.34',
             'fetch_public_image': lambda parsed, resolved_ip: (302, b''),
         }):
-            with self.assertRaisesRegex(ValueError, 'Failed to fetch URL: HTTP 302'):
+            with self.assertRaises(REMOTE_FETCH['RemoteImageHTTPStatusError']) as ctx:
                 REMOTE_FETCH['download_public_image']('https://example.com/avatar.png')
+
+        self.assertEqual(ctx.exception.status_code, 302)
+
+    def test_download_public_image_rejects_embedded_credentials(self):
+        with self.assertRaisesRegex(REMOTE_FETCH['InvalidRemoteImageURLError'], 'Only public http\\(s\\) image URLs are allowed'):
+            REMOTE_FETCH['download_public_image']('******example.com/avatar.png')
 
     def test_resolve_public_ip_prefers_global_addresses(self):
         with patch.object(REMOTE_FETCH['socket'], 'getaddrinfo', return_value=[
@@ -81,6 +91,62 @@ class RemoteImageFetchTests(unittest.TestCase):
             resolved_ip = REMOTE_FETCH['resolve_public_ip']('example.com', 443)
 
         self.assertEqual(resolved_ip, '93.184.216.34')
+
+    def test_fetch_public_image_rejects_large_content_length(self):
+        class FakeResponse:
+            status = 200
+
+            def getheader(self, name):
+                return str(REMOTE_FETCH['MAX_REMOTE_IMAGE_BYTES'] + 1) if name == 'Content-Length' else None
+
+            def read(self, size=-1):
+                return b''
+
+        class FakeConnection:
+            def request(self, method, path, headers):
+                self.request_args = (method, path, headers)
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        parsed = REMOTE_FETCH['parse_public_image_url']('http://example.com/avatar.png')
+        with patch.dict(REMOTE_FETCH, {'ValidatedHTTPConnection': lambda *args, **kwargs: FakeConnection()}):
+            with self.assertRaisesRegex(REMOTE_FETCH['RemoteImageTooLargeError'], str(REMOTE_FETCH['MAX_REMOTE_IMAGE_BYTES'])):
+                REMOTE_FETCH['fetch_public_image'](parsed, '93.184.216.34')
+
+    def test_fetch_public_image_rejects_streaming_overflow(self):
+        class FakeResponse:
+            status = 200
+
+            def __init__(self):
+                self.chunks = [b'12345678', b'9', b'']
+
+            def getheader(self, name):
+                return None
+
+            def read(self, size=-1):
+                return self.chunks.pop(0)
+
+        class FakeConnection:
+            def request(self, method, path, headers):
+                self.request_args = (method, path, headers)
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        parsed = REMOTE_FETCH['parse_public_image_url']('http://example.com/avatar.png')
+        with patch.dict(REMOTE_FETCH, {
+            'MAX_REMOTE_IMAGE_BYTES': 8,
+            'ValidatedHTTPConnection': lambda *args, **kwargs: FakeConnection(),
+        }):
+            with self.assertRaisesRegex(REMOTE_FETCH['RemoteImageTooLargeError'], '8 bytes'):
+                REMOTE_FETCH['fetch_public_image'](parsed, '93.184.216.34')
 
 
 if __name__ == '__main__':

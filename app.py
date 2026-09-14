@@ -86,6 +86,20 @@ def cleanup_rate_limit_storage():
         if not rate_limit_storage[key]:
             del rate_limit_storage[key]
 
+class InvalidRemoteImageURLError(ValueError):
+    pass
+
+class RemoteImageTooLargeError(ValueError):
+    pass
+
+class RemoteImageHTTPStatusError(ValueError):
+    def __init__(self, status_code):
+        super().__init__(status_code)
+        self.status_code = status_code
+
+def remote_image_size_limit_message():
+    return f'Remote image exceeds size limit of {MAX_REMOTE_IMAGE_BYTES} bytes'
+
 def parse_public_image_url(image_url):
     parsed = urlparse(image_url)
 
@@ -154,7 +168,7 @@ def fetch_public_image(parsed, resolved_ip):
             except (TypeError, ValueError):
                 content_length = None
             if content_length is not None and content_length > MAX_REMOTE_IMAGE_BYTES:
-                raise ValueError('Remote image exceeds size limit')
+                raise RemoteImageTooLargeError(remote_image_size_limit_message())
 
         response_body = bytearray()
         while len(response_body) <= MAX_REMOTE_IMAGE_BYTES:
@@ -163,23 +177,23 @@ def fetch_public_image(parsed, resolved_ip):
                 return response.status, bytes(response_body)
             response_body.extend(chunk)
 
-        raise ValueError('Remote image exceeds size limit')
+        raise RemoteImageTooLargeError(remote_image_size_limit_message())
     finally:
         conn.close()
 
 def download_public_image(image_url):
     parsed = parse_public_image_url(image_url)
     if not parsed:
-        raise ValueError('Only public http(s) image URLs are allowed')
+        raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
 
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
     resolved_ip = resolve_public_ip(parsed.hostname, port)
     if not resolved_ip:
-        raise ValueError('Only public http(s) image URLs are allowed')
+        raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
 
     status_code, response_body = fetch_public_image(parsed, resolved_ip)
-    if status_code >= 300:
-        raise ValueError(f'Failed to fetch URL: HTTP {status_code}')
+    if status_code != 200:
+        raise RemoteImageHTTPStatusError(status_code)
 
     return parsed, response_body
 
@@ -724,8 +738,12 @@ def upload_profile_picture_url(current_user):
 
         try:
             parsed, response_body = download_public_image(image_url)
-        except ValueError as exc:
-            return jsonify({'status': 'error', 'message': str(exc)}), 400
+        except InvalidRemoteImageURLError:
+            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
+        except RemoteImageTooLargeError:
+            return jsonify({'status': 'error', 'message': remote_image_size_limit_message()}), 400
+        except RemoteImageHTTPStatusError as exc:
+            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {exc.status_code}'}), 400
         except (OSError, ssl.SSLError, http.client.HTTPException):
             return jsonify({'status': 'error', 'message': 'Failed to fetch URL'}), 400
 
