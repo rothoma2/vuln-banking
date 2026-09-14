@@ -16,8 +16,11 @@ from transaction_graphql import transaction_graphql_schema
 import time
 from functools import wraps
 from collections import defaultdict
-import requests
+import socket
+import ipaddress
 from urllib.parse import urlparse
+import http.client
+import ssl
 import platform
 
 load_dotenv()
@@ -46,6 +49,7 @@ app.secret_key = "secret123"
 RATE_LIMIT_WINDOW = 3 * 60 * 60
 UNAUTHENTICATED_LIMIT = 5
 AUTHENTICATED_LIMIT = 10
+MAX_REMOTE_IMAGE_BYTES = 5 * 1024 * 1024
 
 rate_limit_storage = defaultdict(list)
 
@@ -81,6 +85,128 @@ def cleanup_rate_limit_storage():
         ]
         if not rate_limit_storage[key]:
             del rate_limit_storage[key]
+
+class InvalidRemoteImageURLError(ValueError):
+    pass
+
+class RemoteImageTooLargeError(ValueError):
+    pass
+
+class RemoteImageHTTPStatusError(ValueError):
+    def __init__(self, status_code):
+        super().__init__(status_code)
+        self.status_code = status_code
+
+def remote_image_size_limit_message():
+    return f'Remote image exceeds size limit of {MAX_REMOTE_IMAGE_BYTES} bytes'
+
+def parse_public_image_url(image_url):
+    parsed = urlparse(image_url)
+
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
+        return None
+
+    return parsed
+
+def resolve_public_ips(hostname, port):
+    try:
+        addrinfo = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return []
+
+    resolved_ips = set()
+    for _, _, _, _, sockaddr in addrinfo:
+        ip_text = sockaddr[0].split('%', 1)[0]
+        ip = ipaddress.ip_address(ip_text)
+        if ip.is_global:
+            resolved_ips.add(ip_text)
+
+    return sorted(resolved_ips, key=lambda value: (ipaddress.ip_address(value).version, ipaddress.ip_address(value).packed))
+
+class ValidatedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, resolved_ip, hostname, port, timeout=10):
+        super().__init__(hostname, port=port, timeout=timeout)
+        self.resolved_ip = resolved_ip
+
+    def connect(self):
+        self.sock = self._create_connection((self.resolved_ip, self.port), self.timeout, self.source_address)
+
+class ValidatedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, resolved_ip, hostname, port, timeout=10):
+        super().__init__(hostname, port=port, timeout=timeout, context=ssl.create_default_context())
+        self.resolved_ip = resolved_ip
+
+    def connect(self):
+        sock = self._create_connection((self.resolved_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+def fetch_public_image(parsed, resolved_ips):
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    path = parsed.path or '/'
+    if parsed.params:
+        path = f'{path};{parsed.params}'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+
+    is_default_port = (parsed.scheme == 'http' and port == 80) or (parsed.scheme == 'https' and port == 443)
+    formatted_hostname = f'[{parsed.hostname}]' if ':' in parsed.hostname else parsed.hostname
+    host_header = formatted_hostname if is_default_port else f'{formatted_hostname}:{port}'
+
+    last_error = None
+    for resolved_ip in resolved_ips:
+        if parsed.scheme == 'https':
+            conn = ValidatedHTTPSConnection(resolved_ip, parsed.hostname, port, timeout=10)
+        else:
+            conn = ValidatedHTTPConnection(resolved_ip, parsed.hostname, port, timeout=10)
+
+        try:
+            conn.request('GET', path, headers={'Host': host_header})
+            response = conn.getresponse()
+            content_length = response.getheader('Content-Length')
+            if content_length is not None:
+                try:
+                    content_length = int(content_length)
+                except (TypeError, ValueError):
+                    content_length = None
+                if content_length is not None and content_length > MAX_REMOTE_IMAGE_BYTES:
+                    raise RemoteImageTooLargeError(remote_image_size_limit_message())
+
+            response_body = bytearray()
+            while len(response_body) <= MAX_REMOTE_IMAGE_BYTES:
+                chunk = response.read(min(65536, MAX_REMOTE_IMAGE_BYTES - len(response_body) + 1))
+                if not chunk:
+                    return response.status, bytes(response_body)
+                response_body.extend(chunk)
+
+            raise RemoteImageTooLargeError(remote_image_size_limit_message())
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            conn.close()
+
+    if last_error:
+        raise last_error
+
+    raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
+
+def download_public_image(image_url):
+    parsed = parse_public_image_url(image_url)
+    if not parsed:
+        raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
+
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    resolved_ips = resolve_public_ips(parsed.hostname, port)
+    if not resolved_ips:
+        raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
+
+    status_code, response_body = fetch_public_image(parsed, resolved_ips)
+    if status_code != 200:
+        raise RemoteImageHTTPStatusError(status_code)
+
+    return parsed, response_body
 
 def get_client_ip():
     """Get client IP address, considering proxy headers"""
@@ -621,18 +747,24 @@ def upload_profile_picture_url(current_user):
         if not image_url:
             return jsonify({'status': 'error', 'message': 'image_url is required'}), 400
 
-        resp = requests.get(image_url, timeout=10, allow_redirects=True, verify=False)
-        if resp.status_code >= 400:
-            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {resp.status_code}'}), 400
+        try:
+            parsed, response_body = download_public_image(image_url)
+        except InvalidRemoteImageURLError:
+            return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
+        except RemoteImageTooLargeError:
+            return jsonify({'status': 'error', 'message': remote_image_size_limit_message()}), 400
+        except RemoteImageHTTPStatusError as exc:
+            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {exc.status_code}'}), 400
+        except (OSError, ssl.SSLError, http.client.HTTPException):
+            return jsonify({'status': 'error', 'message': 'Failed to fetch URL'}), 400
 
-        parsed = urlparse(image_url)
         basename = os.path.basename(parsed.path) or 'downloaded'
         filename = secure_filename(basename)
         filename = f"{random.randint(1, 1000000)}_{filename}"
         file_path = os.path.join(UPLOAD_FOLDER, filename)
 
         with open(file_path, 'wb') as f:
-            f.write(resp.content)
+            f.write(response_body)
 
         execute_query(
             "UPDATE users SET profile_picture = %s WHERE id = %s",
