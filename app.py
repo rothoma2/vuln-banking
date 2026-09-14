@@ -108,20 +108,20 @@ def parse_public_image_url(image_url):
 
     return parsed
 
-def resolve_public_ip(hostname, port):
+def resolve_public_ips(hostname, port):
     try:
         addrinfo = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
-        return None
+        return []
 
-    resolved_ips = []
+    resolved_ips = set()
     for _, _, _, _, sockaddr in addrinfo:
         ip_text = sockaddr[0].split('%', 1)[0]
         ip = ipaddress.ip_address(ip_text)
         if ip.is_global:
-            resolved_ips.append(ip_text)
+            resolved_ips.add(ip_text)
 
-    return resolved_ips[0] if resolved_ips else None
+    return sorted(resolved_ips, key=lambda value: (ipaddress.ip_address(value).version, ipaddress.ip_address(value).packed))
 
 class ValidatedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, resolved_ip, hostname, port, timeout=10):
@@ -143,7 +143,7 @@ class ValidatedHTTPSConnection(http.client.HTTPSConnection):
             self._tunnel()
         self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
 
-def fetch_public_image(parsed, resolved_ip):
+def fetch_public_image(parsed, resolved_ips):
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
     path = parsed.path or '/'
     if parsed.params:
@@ -155,33 +155,42 @@ def fetch_public_image(parsed, resolved_ip):
     formatted_hostname = f'[{parsed.hostname}]' if ':' in parsed.hostname else parsed.hostname
     host_header = formatted_hostname if is_default_port else f'{formatted_hostname}:{port}'
 
-    if parsed.scheme == 'https':
-        conn = ValidatedHTTPSConnection(resolved_ip, parsed.hostname, port, timeout=10)
-    else:
-        conn = ValidatedHTTPConnection(resolved_ip, parsed.hostname, port, timeout=10)
+    last_error = None
+    for resolved_ip in resolved_ips:
+        if parsed.scheme == 'https':
+            conn = ValidatedHTTPSConnection(resolved_ip, parsed.hostname, port, timeout=10)
+        else:
+            conn = ValidatedHTTPConnection(resolved_ip, parsed.hostname, port, timeout=10)
 
-    try:
-        conn.request('GET', path, headers={'Host': host_header})
-        response = conn.getresponse()
-        content_length = response.getheader('Content-Length')
-        if content_length is not None:
-            try:
-                content_length = int(content_length)
-            except (TypeError, ValueError):
-                content_length = None
-            if content_length is not None and content_length > MAX_REMOTE_IMAGE_BYTES:
-                raise RemoteImageTooLargeError(remote_image_size_limit_message())
+        try:
+            conn.request('GET', path, headers={'Host': host_header})
+            response = conn.getresponse()
+            content_length = response.getheader('Content-Length')
+            if content_length is not None:
+                try:
+                    content_length = int(content_length)
+                except (TypeError, ValueError):
+                    content_length = None
+                if content_length is not None and content_length > MAX_REMOTE_IMAGE_BYTES:
+                    raise RemoteImageTooLargeError(remote_image_size_limit_message())
 
-        response_body = bytearray()
-        while len(response_body) <= MAX_REMOTE_IMAGE_BYTES:
-            chunk = response.read(min(65536, MAX_REMOTE_IMAGE_BYTES - len(response_body) + 1))
-            if not chunk:
-                return response.status, bytes(response_body)
-            response_body.extend(chunk)
+            response_body = bytearray()
+            while len(response_body) <= MAX_REMOTE_IMAGE_BYTES:
+                chunk = response.read(min(65536, MAX_REMOTE_IMAGE_BYTES - len(response_body) + 1))
+                if not chunk:
+                    return response.status, bytes(response_body)
+                response_body.extend(chunk)
 
-        raise RemoteImageTooLargeError(remote_image_size_limit_message())
-    finally:
-        conn.close()
+            raise RemoteImageTooLargeError(remote_image_size_limit_message())
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            last_error = exc
+        finally:
+            conn.close()
+
+    if last_error:
+        raise last_error
+
+    raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
 
 def download_public_image(image_url):
     parsed = parse_public_image_url(image_url)
@@ -189,11 +198,11 @@ def download_public_image(image_url):
         raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
 
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    resolved_ip = resolve_public_ip(parsed.hostname, port)
-    if not resolved_ip:
+    resolved_ips = resolve_public_ips(parsed.hostname, port)
+    if not resolved_ips:
         raise InvalidRemoteImageURLError('Only public http(s) image URLs are allowed')
 
-    status_code, response_body = fetch_public_image(parsed, resolved_ip)
+    status_code, response_body = fetch_public_image(parsed, resolved_ips)
     if status_code != 200:
         raise RemoteImageHTTPStatusError(status_code)
 
