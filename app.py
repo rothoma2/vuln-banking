@@ -16,10 +16,10 @@ from transaction_graphql import transaction_graphql_schema
 import time
 from functools import wraps
 from collections import defaultdict
-import requests
 import socket
 import ipaddress
 from urllib.parse import urlparse
+import urllib3
 import platform
 
 load_dotenv()
@@ -87,20 +87,57 @@ def cleanup_rate_limit_storage():
 def is_public_image_url(image_url):
     parsed = urlparse(image_url)
 
-    if parsed.scheme not in {'http', 'https'} or not parsed.hostname:
+    if parsed.scheme not in {'http', 'https'} or not parsed.hostname or parsed.username or parsed.password:
         return False
 
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    return resolve_public_ip(parsed.hostname, port) is not None
+
+def resolve_public_ip(hostname, port):
     try:
-        addrinfo = socket.getaddrinfo(parsed.hostname, parsed.port or None, type=socket.SOCK_STREAM)
+        addrinfo = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except socket.gaierror:
-        return False
+        return None
 
+    resolved_ips = []
     for _, _, _, _, sockaddr in addrinfo:
         ip = ipaddress.ip_address(sockaddr[0])
         if not ip.is_global:
-            return False
+            return None
+        resolved_ips.append(sockaddr[0])
 
-    return True
+    return resolved_ips[0] if resolved_ips else None
+
+def fetch_public_image_url(image_url):
+    parsed = urlparse(image_url)
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    resolved_ip = resolve_public_ip(parsed.hostname, port)
+
+    if not resolved_ip:
+        raise ValueError('Only public http(s) image URLs are allowed')
+
+    path = parsed.path or '/'
+    if parsed.params:
+        path = f'{path};{parsed.params}'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+
+    is_default_port = (parsed.scheme == 'http' and port == 80) or (parsed.scheme == 'https' and port == 443)
+    host_header = parsed.hostname if is_default_port else f'{parsed.hostname}:{port}'
+    timeout = urllib3.Timeout(connect=10, read=10)
+
+    if parsed.scheme == 'https':
+        pool = urllib3.HTTPSConnectionPool(
+            host=resolved_ip,
+            port=port,
+            cert_reqs='CERT_REQUIRED',
+            assert_hostname=parsed.hostname,
+            server_hostname=parsed.hostname
+        )
+    else:
+        pool = urllib3.HTTPConnectionPool(host=resolved_ip, port=port)
+
+    return pool.urlopen('GET', path, headers={'Host': host_header}, redirect=False, timeout=timeout, preload_content=True)
 
 def get_client_ip():
     """Get client IP address, considering proxy headers"""
@@ -644,9 +681,9 @@ def upload_profile_picture_url(current_user):
         if not is_public_image_url(image_url):
             return jsonify({'status': 'error', 'message': 'Only public http(s) image URLs are allowed'}), 400
 
-        resp = requests.get(image_url, timeout=10, allow_redirects=False)
-        if resp.status_code >= 300:
-            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {resp.status_code}'}), 400
+        resp = fetch_public_image_url(image_url)
+        if resp.status >= 300:
+            return jsonify({'status': 'error', 'message': f'Failed to fetch URL: HTTP {resp.status}'}), 400
 
         parsed = urlparse(image_url)
         basename = os.path.basename(parsed.path) or 'downloaded'
@@ -655,7 +692,7 @@ def upload_profile_picture_url(current_user):
         file_path = os.path.join(UPLOAD_FOLDER, filename)
 
         with open(file_path, 'wb') as f:
-            f.write(resp.content)
+            f.write(resp.data)
 
         execute_query(
             "UPDATE users SET profile_picture = %s WHERE id = %s",
