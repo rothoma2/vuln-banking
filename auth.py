@@ -158,10 +158,15 @@ def init_auth_routes(app):
                 conn.close()
                 return jsonify({'error': 'Account not found'}), 404
 
-            conn.commit()
-            
             c.execute("SELECT username, balance FROM users WHERE account_number=?", (to_account,))
             recipient = c.fetchone()
+
+            if not recipient:
+                conn.rollback()
+                conn.close()
+                return jsonify({'error': 'Account not found'}), 404
+
+            conn.commit()
             
             conn.close()
             return jsonify({
