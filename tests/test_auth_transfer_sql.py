@@ -7,10 +7,10 @@ import auth
 
 
 class MockCursor:
-    def __init__(self):
+    def __init__(self, recipient_rows=None):
         self.calls = []
         self._results = [(1000.0,)]
-        self._recipient_rows = {"ACC002' OR '1'='1": ('recipient', 1100.0)}
+        self._recipient_rows = recipient_rows or {"ACC002' OR '1'='1": ('recipient', 1100.0)}
         self._updated_recipient = None
         self.rowcount = 0
 
@@ -28,8 +28,8 @@ class MockCursor:
 
 
 class MockConnection:
-    def __init__(self):
-        self.cursor_obj = MockCursor()
+    def __init__(self, recipient_rows=None):
+        self.cursor_obj = MockCursor(recipient_rows=recipient_rows)
         self.committed = False
         self.rolled_back = False
         self.closed = False
@@ -79,6 +79,22 @@ class TransferSqlInjectionTest(unittest.TestCase):
             ("SELECT username, balance FROM users WHERE account_number=?", (malicious_to_account,)),
         )
         self.assertTrue(mock_conn.committed)
+
+    def test_transfer_rolls_back_when_recipient_missing(self):
+        mock_conn = MockConnection(recipient_rows={})
+        token = auth.generate_token(user_id=1, username='alice')
+        missing_account = "DOES-NOT-EXIST"
+
+        with patch('auth.sqlite3.connect', return_value=mock_conn):
+            response = self.client.post(
+                '/api/transfer',
+                query_string={'token': token},
+                json={'to_account': missing_account, 'amount': '100'},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_conn.committed)
+        self.assertTrue(mock_conn.rolled_back)
 
 
 if __name__ == '__main__':
