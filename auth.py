@@ -145,6 +145,12 @@ def init_auth_routes(app):
         
         conn = sqlite3.connect('bank.db')
         c = conn.cursor()
+
+        c.execute("SELECT username, balance FROM users WHERE account_number=?", (to_account,))
+        recipient = c.fetchone()
+        if not recipient:
+            conn.close()
+            return jsonify({'error': 'Account not found'}), 404
         
         c.execute("SELECT balance FROM users WHERE id=?", (current_user['user_id'],))
         balance = c.fetchone()[0]
@@ -158,14 +164,6 @@ def init_auth_routes(app):
                 conn.close()
                 return jsonify({'error': 'Account not found'}), 404
 
-            c.execute("SELECT username, balance FROM users WHERE account_number=?", (to_account,))
-            recipient = c.fetchone()
-
-            if not recipient:
-                conn.rollback()
-                conn.close()
-                return jsonify({'error': 'Account not found'}), 404
-
             conn.commit()
             
             conn.close()
@@ -173,7 +171,7 @@ def init_auth_routes(app):
                 'status': 'success',
                 'new_balance': balance - amount,
                 'recipient': recipient[0],
-                'recipient_new_balance': recipient[1]
+                'recipient_new_balance': recipient[1] + amount
             })
             
         conn.close()

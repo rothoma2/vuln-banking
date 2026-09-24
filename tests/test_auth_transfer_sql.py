@@ -9,22 +9,27 @@ import auth
 class MockCursor:
     def __init__(self, recipient_rows=None):
         self.calls = []
-        self._results = [(1000.0,)]
-        self._recipient_rows = recipient_rows or {"ACC002' OR '1'='1": ('recipient', 1100.0)}
+        self._recipient_rows = recipient_rows or {"ACC002' OR '1'='1": ('recipient', 1000.0)}
         self._updated_recipient = None
+        self._last_query = None
+        self._last_params = None
         self.rowcount = 0
 
     def execute(self, query, params=None):
         self.calls.append((query, params))
+        self._last_query = query
+        self._last_params = params
         self.rowcount = 1
         if query == "UPDATE users SET balance = balance + ? WHERE account_number=?":
             self._updated_recipient = params[1]
             self.rowcount = 1 if self._updated_recipient in self._recipient_rows else 0
 
     def fetchone(self):
-        if self._results:
-            return self._results.pop(0)
-        return self._recipient_rows.get(self._updated_recipient)
+        if self._last_query == "SELECT username, balance FROM users WHERE account_number=?":
+            return self._recipient_rows.get(self._last_params[0])
+        if self._last_query == "SELECT balance FROM users WHERE id=?":
+            return (1000.0,)
+        return None
 
 
 class MockConnection:
@@ -71,15 +76,15 @@ class TransferSqlInjectionTest(unittest.TestCase):
         self.assertEqual(body['recipient_new_balance'], 1100.0)
 
         calls = mock_conn.cursor_obj.calls
-        self.assertEqual(calls[0], ("SELECT balance FROM users WHERE id=?", (1,)))
-        self.assertEqual(calls[1], ("UPDATE users SET balance = balance - ? WHERE id=?", (100.0, 1)))
+        self.assertEqual(calls[0], ("SELECT username, balance FROM users WHERE account_number=?", (malicious_to_account,)))
+        self.assertEqual(calls[1], ("SELECT balance FROM users WHERE id=?", (1,)))
         self.assertEqual(
             calls[2],
-            ("UPDATE users SET balance = balance + ? WHERE account_number=?", (100.0, malicious_to_account)),
+            ("UPDATE users SET balance = balance - ? WHERE id=?", (100.0, 1)),
         )
         self.assertEqual(
             calls[3],
-            ("SELECT username, balance FROM users WHERE account_number=?", (malicious_to_account,)),
+            ("UPDATE users SET balance = balance + ? WHERE account_number=?", (100.0, malicious_to_account)),
         )
         self.assertTrue(mock_conn.committed)
 
@@ -97,7 +102,7 @@ class TransferSqlInjectionTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertFalse(mock_conn.committed)
-        self.assertTrue(mock_conn.rolled_back)
+        self.assertFalse(mock_conn.rolled_back)
 
 
 if __name__ == '__main__':
