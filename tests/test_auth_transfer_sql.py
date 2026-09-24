@@ -66,6 +66,9 @@ class TransferSqlInjectionTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertEqual(body['recipient'], 'recipient')
+        self.assertEqual(body['recipient_new_balance'], 1100.0)
 
         calls = mock_conn.cursor_obj.calls
         self.assertEqual(calls[0], ("SELECT balance FROM users WHERE id=?", (1,)))
