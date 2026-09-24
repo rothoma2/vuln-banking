@@ -7,10 +7,11 @@ import auth
 
 
 class MockCursor:
-    def __init__(self, recipient_rows=None):
+    def __init__(self, recipient_rows=None, fail_update_for=None):
         self.calls = []
         self._recipient_rows = recipient_rows or {"ACC002' OR '1'='1": ('recipient', 1000.0)}
         self._updated_recipient = None
+        self._fail_update_for = fail_update_for or set()
         self._last_query = None
         self._last_params = None
         self.rowcount = 0
@@ -22,7 +23,10 @@ class MockCursor:
         self.rowcount = 1
         if query == "UPDATE users SET balance = balance + ? WHERE account_number=?":
             self._updated_recipient = params[1]
-            self.rowcount = 1 if self._updated_recipient in self._recipient_rows else 0
+            if self._updated_recipient in self._fail_update_for:
+                self.rowcount = 0
+            else:
+                self.rowcount = 1 if self._updated_recipient in self._recipient_rows else 0
 
     def fetchone(self):
         if self._last_query == "SELECT username, balance FROM users WHERE account_number=?":
@@ -33,8 +37,8 @@ class MockCursor:
 
 
 class MockConnection:
-    def __init__(self, recipient_rows=None):
-        self.cursor_obj = MockCursor(recipient_rows=recipient_rows)
+    def __init__(self, recipient_rows=None, fail_update_for=None):
+        self.cursor_obj = MockCursor(recipient_rows=recipient_rows, fail_update_for=fail_update_for)
         self.committed = False
         self.rolled_back = False
         self.closed = False
@@ -88,10 +92,13 @@ class TransferSqlInjectionTest(unittest.TestCase):
         )
         self.assertTrue(mock_conn.committed)
 
-    def test_transfer_rolls_back_when_recipient_missing(self):
-        mock_conn = MockConnection(recipient_rows={})
+    def test_transfer_rolls_back_when_recipient_update_affects_no_rows(self):
         token = auth.generate_token(user_id=1, username='alice')
-        missing_account = "DOES-NOT-EXIST"
+        missing_account = "ACC404"
+        mock_conn = MockConnection(
+            recipient_rows={missing_account: ('recipient', 1000.0)},
+            fail_update_for={missing_account},
+        )
 
         with patch('auth.sqlite3.connect', return_value=mock_conn):
             response = self.client.post(
@@ -102,7 +109,7 @@ class TransferSqlInjectionTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertFalse(mock_conn.committed)
-        self.assertFalse(mock_conn.rolled_back)
+        self.assertTrue(mock_conn.rolled_back)
 
 
 if __name__ == '__main__':
