@@ -111,6 +111,22 @@ class TransferSqlInjectionTest(unittest.TestCase):
         self.assertFalse(mock_conn.committed)
         self.assertTrue(mock_conn.rolled_back)
 
+    def test_transfer_rejects_unknown_recipient_before_updates(self):
+        mock_conn = MockConnection(recipient_rows={})
+        token = auth.generate_token(user_id=1, username='alice')
+        missing_account = "DOES-NOT-EXIST"
+
+        with patch('auth.sqlite3.connect', return_value=mock_conn):
+            response = self.client.post(
+                '/api/transfer',
+                query_string={'token': token},
+                json={'to_account': missing_account, 'amount': '100'},
+            )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertFalse(mock_conn.committed)
+        self.assertFalse(mock_conn.rolled_back)
+
 
 if __name__ == '__main__':
     unittest.main()
