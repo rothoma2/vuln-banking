@@ -9,16 +9,19 @@ import auth
 class MockCursor:
     def __init__(self):
         self.calls = []
-        self._results = [
-            (1000.0,),
-            ('recipient', 1100.0),
-        ]
+        self._results = [(1000.0,)]
+        self._recipient_rows = {"ACC002' OR '1'='1": ('recipient', 1100.0)}
+        self._updated_recipient = None
 
     def execute(self, query, params=None):
         self.calls.append((query, params))
+        if query == "UPDATE users SET balance = balance + ? WHERE account_number=?":
+            self._updated_recipient = params[1]
 
     def fetchone(self):
-        return self._results.pop(0)
+        if self._results:
+            return self._results.pop(0)
+        return self._recipient_rows.get(self._updated_recipient)
 
 
 class MockConnection:
