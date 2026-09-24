@@ -12,11 +12,14 @@ class MockCursor:
         self._results = [(1000.0,)]
         self._recipient_rows = {"ACC002' OR '1'='1": ('recipient', 1100.0)}
         self._updated_recipient = None
+        self.rowcount = 0
 
     def execute(self, query, params=None):
         self.calls.append((query, params))
+        self.rowcount = 1
         if query == "UPDATE users SET balance = balance + ? WHERE account_number=?":
             self._updated_recipient = params[1]
+            self.rowcount = 1 if self._updated_recipient in self._recipient_rows else 0
 
     def fetchone(self):
         if self._results:
@@ -28,6 +31,7 @@ class MockConnection:
     def __init__(self):
         self.cursor_obj = MockCursor()
         self.committed = False
+        self.rolled_back = False
         self.closed = False
 
     def cursor(self):
@@ -35,6 +39,9 @@ class MockConnection:
 
     def commit(self):
         self.committed = True
+
+    def rollback(self):
+        self.rolled_back = True
 
     def close(self):
         self.closed = True
@@ -71,6 +78,7 @@ class TransferSqlInjectionTest(unittest.TestCase):
             calls[3],
             ("SELECT username, balance FROM users WHERE account_number=?", (malicious_to_account,)),
         )
+        self.assertTrue(mock_conn.committed)
 
 
 if __name__ == '__main__':

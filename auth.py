@@ -152,6 +152,12 @@ def init_auth_routes(app):
         if balance >= amount:
             c.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, current_user['user_id']))
             c.execute("UPDATE users SET balance = balance + ? WHERE account_number=?", (amount, to_account))
+
+            if c.rowcount == 0:
+                conn.rollback()
+                conn.close()
+                return jsonify({'error': 'Account not found'}), 404
+
             conn.commit()
             
             c.execute("SELECT username, balance FROM users WHERE account_number=?", (to_account,))
